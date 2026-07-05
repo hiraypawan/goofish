@@ -1,0 +1,7 @@
+chrome_profile/
+chrome_profile_debug/
+screenshots/
+used_numbers.json
+__pycache__/
+*.pyc
+.env
