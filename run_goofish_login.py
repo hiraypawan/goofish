@@ -54,10 +54,9 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS = [
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
-    "meta-llama/llama-4-scout:free",
-    "qwen/qwen2.5-vl-72b-instruct:free",
-    "google/gemini-2.0-flash-001",
-    "google/gemini-2.5-flash-preview",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "nvidia/nemotron-3-nano-omni:free",
+    "openrouter/free",
 ]
 
 
@@ -1072,6 +1071,7 @@ async def run_goofish_login():
             for ca in range(3):
                 captcha_vis = False
                 captcha_box = None
+                captcha_frame = None  # Save the frame that has the CAPTCHA
 
                 # POLL for CAPTCHA to appear (up to 15s)
                 for poll in range(15):
@@ -1082,6 +1082,7 @@ async def run_goofish_login():
                                 captcha_vis = True
                                 if result.get("grid") and len(result.get("grid", [])) >= 6:
                                     captcha_box = result
+                                    captcha_frame = fr  # Save this frame!
                                     print(f"    Grid: {result.get('imgCount')} canvas cells, box: ({int(result['x'])},{int(result['y'])}) {int(result['w'])}x{int(result['h'])}")
                                     print(f"    Signals -> container:{result.get('hasContainer')} text:{result.get('hasText')} grid:{result.get('imgCount')}")
                                     if result.get("debug"):
@@ -1104,31 +1105,39 @@ async def run_goofish_login():
 
                 print(f"    CAPTCHA detected! Attempt {ca+1}/3")
 
-                await page.wait_for_timeout(2000)
+                # Wait for canvas images to load
+                print("    Waiting for canvas images to load...")
+                await page.wait_for_timeout(3000)
 
-                # Get instruction text
+                # Get instruction text from the CAPTCHA frame
                 instruction_text = None
-                for fr in page.frames:
+                if captcha_frame:
                     try:
-                        instruction_text = await fr.evaluate(get_instruction_js)
+                        instruction_text = await captcha_frame.evaluate(get_instruction_js)
                         if instruction_text:
                             print(f"    Instruction: {instruction_text}")
-                            break
                     except:
-                        continue
+                        pass
 
-                # Capture grid images directly from canvas elements (includes instruction canvas)
+                # Capture grid images directly from canvas elements in the CAPTCHA frame
                 captured = None
-                for fr in page.frames:
-                    try:
-                        captured = await fr.evaluate(capture_grid_js)
-                        if captured and captured.get("grid"):
-                            grid_count = sum(1 for x in captured["grid"] if x)
-                            has_instr = "Yes" if captured.get("instruction") else "No"
-                            print(f"    Captured {grid_count} grid images + instruction: {has_instr}")
+                if captcha_frame:
+                    for capture_retry in range(3):
+                        try:
+                            captured = await captcha_frame.evaluate(capture_grid_js)
+                            if captured:
+                                grid_count = sum(1 for x in captured.get("grid", []) if x)
+                                has_instr = "Yes" if captured.get("instruction") else "No"
+                                print(f"    Captured {grid_count} grid images + instruction: {has_instr}")
+                                if grid_count >= 9:
+                                    break
+                                # Retry if not all images loaded yet
+                                print(f"    Only {grid_count}/9 images, retrying...")
+                                await page.wait_for_timeout(1000)
+                                captured = None
+                        except Exception as e:
+                            print(f"    Capture error: {e}")
                             break
-                    except:
-                        continue
 
                 # Take full page screenshot
                 ss = await page.screenshot()
