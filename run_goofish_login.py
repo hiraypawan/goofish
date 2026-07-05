@@ -126,12 +126,12 @@ async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, g
             gap = 4
             instr_h = 60  # Height for instruction area
             
-            # If we have instruction canvas image, use its size for header
+            # If we have instruction canvas image, use its size for header (3x scaled)
             if instruction_img_b64:
                 try:
                     instr_data = instruction_img_b64.split(',')[1] if ',' in instruction_img_b64 else instruction_img_b64
                     instr_img = Image.open(BytesIO(b64mod.b64decode(instr_data)))
-                    instr_h = max(60, instr_img.height + 20)
+                    instr_h = max(60, instr_img.height * 3 + 20)  # 3x scale + padding
                 except:
                     pass
             
@@ -146,13 +146,13 @@ async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, g
                 try:
                     instr_data = instruction_img_b64.split(',')[1] if ',' in instruction_img_b64 else instruction_img_b64
                     instr_img = Image.open(BytesIO(b64mod.b64decode(instr_data)))
-                    # Scale up for better visibility
-                    scale = min(total_w / instr_img.width, instr_h / instr_img.height)
-                    new_w = int(instr_img.width * scale)
-                    new_h = int(instr_img.height * scale)
+                    # Scale up 3x for much better visibility - the text is small and stylized
+                    scale = 3
+                    new_w = instr_img.width * scale
+                    new_h = instr_img.height * scale
                     instr_img = instr_img.resize((new_w, new_h), Image.LANCZOS)
                     composed.paste(instr_img, (10, 5))
-                    print(f"    Instruction canvas: {instr_img.width}x{instr_img.height}")
+                    print(f"    Instruction canvas: {instr_img.width}x{instr_img.height} (scaled {scale}x)")
                 except Exception as e:
                     print(f"    Instruction canvas error: {e}")
             elif instruction_text:
@@ -222,32 +222,29 @@ async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, g
 
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    # Build prompt with instruction if available
-    if instruction_text:
-        prompt = f"""This is a CAPTCHA puzzle. The instruction text says: "{instruction_text}"
+    # Build prompt - emphasize that ORDER matters (connect 1st→2nd→3rd→4th)
+    prompt = """This is a CAPTCHA puzzle. Look at the INSTRUCTION IMAGE at the top of this image.
 
-Below is a 3x3 grid of 9 images (numbered 0-8):
+The instruction shows Chinese text "请依次连出——" followed by 3-4 OBJECT NAMES written in stylized/distorted text.
+IMPORTANT: "依次" means "in order" - you MUST identify the objects in the EXACT ORDER they appear in the instruction text.
+
+Below is a 3x3 grid of 9 photos (numbered 0-8 in red):
 0 1 2
 3 4 5
 6 7 8
 
-Identify what each image shows, then return the indices (0-8) of the 3 objects mentioned in the instruction, in order.
+STEPS:
+1. Look at the instruction image at the top. Read the object names after the "——" dash.
+2. The objects appear LEFT to RIGHT in the instruction text. That is the ORDER you must click them.
+3. Find each object in the 9-photo grid below.
+4. Return the grid indices (0-8) in the SAME ORDER as the instruction text.
 
-Example: If instruction mentions handbag=4, panda=1, horse=7:
-{{"type":"grid_click","indices":[4,1,7]}}
+Example: If instruction shows "请依次连出——手提包 大熊猫 马":
+- 1st object = handbag, 2nd = panda, 3rd = horse
+- If handbag is at grid position 4, panda at 1, horse at 7:
+- Answer: {"type":"grid_click","indices":[4,1,7]}
 
-Return ONLY the JSON, no other text."""
-    else:
-        prompt = """This is a CAPTCHA puzzle with a 3x3 grid of 9 images (numbered 0-8):
-0 1 2
-3 4 5
-6 7 8
-
-Read the instruction text at the top to find which 3 objects to locate.
-Return the indices (0-8) of the matching images in order.
-
-Example: {{"type":"grid_click","indices":[4,1,7]}}
-
+CRITICAL: The ORDER of indices MUST match the ORDER of objects in the instruction text.
 Return ONLY the JSON, no other text."""
 
     payload = {
