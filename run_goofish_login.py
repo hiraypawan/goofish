@@ -39,8 +39,8 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Free vision models (try in order)
 OPENROUTER_MODELS = [
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "meta-llama/llama-2-70b-chat",
+    "mistralai/mistral-7b-instruct",
     "openrouter/free",
 ]
 
@@ -117,19 +117,25 @@ async def solve_captcha_with_ai(page, screenshot_bytes):
 
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    prompt = """This image shows a CAPTCHA puzzle. At the top there is Chinese text like "请依次连出——" followed by object names.
+    prompt = """This image shows a 3x3 CAPTCHA grid puzzle. You MUST:
 
-You must identify:
-1. Read the Chinese text at the TOP of the popup (the part after "——"). It lists object names.
-2. Find those objects in the 3x3 grid of images below.
-3. Give the x,y center coordinates of each matching image.
+1. Read the Chinese instruction text at the TOP (after "——"). It lists 3 object names to find.
+2. Locate each object in the 3x3 grid below (9 images total).
+3. Return the EXACT center pixel coordinates of each matching image IN THIS IMAGE.
 
-For example, if text says "请依次连出——手提包 大熊猫 马" then find handbag, panda, horse in the grid.
+CRITICAL: The coordinates MUST be relative to THIS CROPPED IMAGE, not the full page.
 
-Reply with ONLY this JSON format:
-{"positions":[{"x":400,"y":300,"label":"handbag"},{"x":500,"y":400,"label":"panda"}]}
+Example instruction: "请依次连出——手提包 大熊猫 马" means find: handbag, panda, horse
 
-The x,y values are pixel coordinates of the CENTER of each matching image. Include ONLY images that match the text names."""
+RETURN ONLY THIS JSON:
+{"positions":[{"x":85,"y":95,"label":"handbag"},{"x":170,"y":95,"label":"panda"},{"x":255,"y":95,"label":"horse"}]}
+
+Rules:
+- x ranges from 0 to image width
+- y ranges from 0 to image height
+- x,y must be the CENTER point of each image
+- Return EXACTLY 3 objects matching the instruction text
+- NO OTHER TEXT, ONLY JSON"""
 
     payload = {
         "model": "",
@@ -830,7 +836,7 @@ async def run_goofish_login():
 
                 print(f"    CAPTCHA detected! Attempt {ca+1}/3")
 
-                # WAIT for CAPTCHA images to fully load
+                # WAIT for CAPTCHA images to fully load (all 9 grid images)
                 print("    Waiting for CAPTCHA images to load...")
                 for img_wait in range(10):
                     images_loaded = False
@@ -839,12 +845,12 @@ async def run_goofish_login():
                             images_loaded = await fr.evaluate("""
                                 () => {
                                     const imgs = document.querySelectorAll('img');
-                                    if (imgs.length === 0) return false;
+                                    if (imgs.length < 9) return false;
                                     let loaded = 0;
                                     for (const img of imgs) {
-                                        if (img.complete && img.naturalWidth > 0) loaded++;
+                                        if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) loaded++;
                                     }
-                                    return loaded >= 5;
+                                    return loaded >= 9;
                                 }
                             """)
                             if images_loaded:
@@ -852,7 +858,7 @@ async def run_goofish_login():
                         except:
                             continue
                     if images_loaded:
-                        print(f"    Images loaded after {img_wait+1}s")
+                        print(f"    All 9 images loaded after {img_wait+1}s")
                         break
                     await page.wait_for_timeout(1000)
 
@@ -895,12 +901,12 @@ async def run_goofish_login():
                 print("    Sending to AI...")
                 sol = await solve_captcha_with_ai(page, ss_cropped)
 
-                # Adjust coordinates to full page if we cropped
-                if sol and sol.get("positions") and captcha_box:
+                # Adjust coordinates to full page ONLY if we cropped (cx, cy > 0)
+                if sol and sol.get("positions") and (cx > 0 or cy > 0):
                     for pos in sol["positions"]:
                         pos["x"] = pos["x"] + cx
                         pos["y"] = pos["y"] + cy
-                    print(f"    Adjusted coordinates to page: {sol['positions']}")
+                    print(f"    Adjusted coordinates: +({cx},{cy}) -> {sol['positions'][:2]}")
                 if sol:
                     print(f"    AI solution: {sol}")
                     if await execute_captcha_action(page, sol):
