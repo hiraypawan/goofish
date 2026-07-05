@@ -50,13 +50,13 @@ OTP_MAX_RETRIES = 3
 # OpenRouter - FREE vision models (get key at https://openrouter.ai/keys)
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Vision models (free first, then cheap paid fallbacks)
+# Vision models: free first, then cheap paid fallback (~$0.001 per CAPTCHA)
 OPENROUTER_MODELS = [
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/nemotron-3-nano-omni:free",
     "openrouter/free",
+    "google/gemini-2.0-flash-001",
 ]
 
 
@@ -276,7 +276,7 @@ Return ONLY the JSON, no other text."""
                                                 timeout=aiohttp.ClientTimeout(total=60)) as resp:
                             raw = await resp.text()
                             if resp.status == 429:
-                                wait_time = 8 * (retry + 1)
+                                wait_time = 12 * (retry + 1)
                                 print(f"    Rate limited, waiting {wait_time}s...")
                                 await asyncio.sleep(wait_time)
                                 continue
@@ -286,9 +286,9 @@ Return ONLY the JSON, no other text."""
                             data = json.loads(raw)
                             text = data["choices"][0]["message"]["content"]
                             print(f"    AI: {text[:500]}")
-                            # Check if AI refused to help
-                            if any(refuse in text.lower() for refuse in ["cannot assist", "cannot help", "not able to", "i'm sorry", "beyond my capabilities"]):
-                                print(f"    Model refused, trying next...")
+                            # Check if AI refused to help or gave useless response
+                            if any(refuse in text.lower() for refuse in ["cannot assist", "cannot help", "not able to", "i'm sorry", "beyond my capabilities", "user safety", "safe"]):
+                                print(f"    Model refused/gave useless response, trying next...")
                                 break
                             sol = parse_ai_response(text)
                             if sol and sol.get("type") == "grid_click":
