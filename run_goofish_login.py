@@ -103,7 +103,7 @@ def mark_number_used(phone):
 
 
 # ==================== AI CAPTCHA SOLVER (Pollinations.ai - FREE) ====================
-async def solve_captcha_with_ai(page, screenshot_bytes):
+async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, grid_images_b64=None):
     """Send CAPTCHA screenshot to OpenRouter FREE vision API."""
     import aiohttp
 
@@ -112,39 +112,102 @@ async def solve_captcha_with_ai(page, screenshot_bytes):
         print("    Get free key at: https://openrouter.ai/keys")
         return None
 
-    # Convert to JPEG and resize
+    # Compose image: either from grid images or from cropped screenshot
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw, ImageFont
         from io import BytesIO
-        img = Image.open(BytesIO(screenshot_bytes))
-        max_w = 500
-        if img.width > max_w:
-            ratio = max_w / img.width
-            img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
-        buf = BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=70)
-        img_bytes = buf.getvalue()
-        print(f"    Image: {img.width}x{img.height}, {len(img_bytes)} bytes")
-    except:
+
+        if grid_images_b64 and any(grid_images_b64):
+            # Compose a 3x3 grid from individual canvas captures
+            import base64 as b64mod
+            cell_size = 120  # Original canvas size
+            gap = 4
+            total_w = cell_size * 3 + gap * 2
+            total_h = cell_size * 3 + gap * 2 + 60  # Extra space for instruction
+            
+            composed = Image.new('RGB', (total_w, total_h), (255, 255, 255))
+            draw = ImageDraw.Draw(composed)
+            
+            # Draw instruction area at top
+            if instruction_text:
+                try:
+                    font = ImageFont.truetype("arial.ttf", 20)
+                except:
+                    font = ImageFont.load_default()
+                draw.text((10, 10), instruction_text, fill=(0, 0, 0), font=font)
+            
+            # Place 9 grid images
+            for i, b64_data in enumerate(grid_images_b64):
+                if not b64_data:
+                    continue
+                try:
+                    # Remove data URL prefix
+                    if ',' in b64_data:
+                        b64_data = b64_data.split(',')[1]
+                    img_bytes = b64mod.b64decode(b64_data)
+                    cell = Image.open(BytesIO(img_bytes))
+                    cell = cell.resize((cell_size, cell_size), Image.LANCZOS)
+                    row, col = i // 3, i % 3
+                    x = col * (cell_size + gap)
+                    y = 60 + row * (cell_size + gap)  # Offset for instruction area
+                    composed.paste(cell, (x, y))
+                except Exception as e:
+                    print(f"    Grid cell {i} error: {e}")
+            
+            # Draw grid lines for clarity
+            for i in range(4):
+                x = i * (cell_size + gap)
+                draw.line([(x, 60), (x, total_h)], fill=(200, 200, 200), width=1)
+                draw.line([(0, 60 + i * (cell_size + gap)), (total_w, 60 + i * (cell_size + gap))], fill=(200, 200, 200), width=1)
+            
+            buf = BytesIO()
+            composed.save(buf, format="JPEG", quality=95)
+            img_bytes = buf.getvalue()
+            print(f"    Composed grid: {composed.width}x{composed.height}")
+        else:
+            # Use cropped screenshot
+            img = Image.open(BytesIO(screenshot_bytes))
+            max_w = 500
+            if img.width > max_w:
+                ratio = max_w / img.width
+                img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+            buf = BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=90)
+            img_bytes = buf.getvalue()
+            print(f"    Screenshot: {img.width}x{img.height}, {len(img_bytes)} bytes")
+    except Exception as e:
+        print(f"    Image compose error: {e}")
         img_bytes = screenshot_bytes
 
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    prompt = """This is a CAPTCHA with a 3x3 grid of 9 photos (numbered 0-8, left-to-right, top-to-bottom).
+    # Build prompt with instruction if available
+    if instruction_text:
+        prompt = f"""This is a CAPTCHA puzzle. The instruction text says: "{instruction_text}"
 
-Grid layout:
+Below is a 3x3 grid of 9 images (numbered 0-8):
 0 1 2
 3 4 5
 6 7 8
 
-1. Read the Chinese instruction text at the top. It lists 3 objects to find.
-2. Identify each of the 9 images in the grid.
-3. Return the indices (0-8) of the 3 matching objects in order.
+Identify what each image shows, then return the indices (0-8) of the 3 objects mentioned in the instruction, in order.
 
-Example: If instruction says "请依次连出——手提包 大熊猫 马" and handbag=4, panda=1, horse=7:
-{"type":"grid_click","indices":[4,1,7]}
+Example: If instruction mentions handbag=4, panda=1, horse=7:
+{{"type":"grid_click","indices":[4,1,7]}}
 
-Be concise. Return ONLY the JSON."""
+Return ONLY the JSON, no other text."""
+    else:
+        prompt = """This is a CAPTCHA puzzle with a 3x3 grid of 9 images (numbered 0-8):
+0 1 2
+3 4 5
+6 7 8
+
+Read the instruction text at the top to find which 3 objects to locate.
+Return the indices (0-8) of the matching images in order.
+
+Example: {{"type":"grid_click","indices":[4,1,7]}}
+
+Return ONLY the JSON, no other text."""
 
     payload = {
         "model": "",
@@ -907,6 +970,44 @@ async def run_goofish_login():
                 }
             """
 
+            # JS to extract instruction text from canvas
+            get_instruction_js = """
+                () => {
+                    const canvas = document.querySelector('#connect-question-canvas');
+                    if (!canvas) return null;
+                    // The instruction is rendered in canvas, try to get it from nearby text
+                    const h1 = document.querySelector('.h1');
+                    if (h1) return h1.textContent.trim();
+                    // Fallback: check for text in the header
+                    const header = document.querySelector('.connect-captcha-question-header');
+                    if (header) return header.textContent.trim();
+                    return null;
+                }
+            """
+
+            # JS to capture each grid canvas as base64 image
+            capture_grid_js = """
+                () => {
+                    const results = [];
+                    for (let i = 0; i < 9; i++) {
+                        const canvas = document.querySelector('#connect-grid-' + i);
+                        if (!canvas) { results.push(null); continue; }
+                        try {
+                            // Draw canvas to temp canvas to get clean data
+                            const tmp = document.createElement('canvas');
+                            tmp.width = canvas.width;
+                            tmp.height = canvas.height;
+                            const ctx = tmp.getContext('2d');
+                            ctx.drawImage(canvas, 0, 0);
+                            results.push(tmp.toDataURL('image/png'));
+                        } catch(e) {
+                            results.push(null);
+                        }
+                    }
+                    return results;
+                }
+            """
+
             for ca in range(3):
                 captcha_vis = False
                 captcha_box = None
@@ -937,60 +1038,94 @@ async def run_goofish_login():
                     print("    No CAPTCHA - proceeding")
                     break
                 if not captcha_box:
-                    print("    CAPTCHA detected but grid not found - capturing full popup for AI")
+                    print("    CAPTCHA detected but grid not found")
+                    continue
 
                 print(f"    CAPTCHA detected! Attempt {ca+1}/3")
 
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
 
+                # Get instruction text
+                instruction_text = None
+                for fr in page.frames:
+                    try:
+                        instruction_text = await fr.evaluate(get_instruction_js)
+                        if instruction_text:
+                            print(f"    Instruction: {instruction_text}")
+                            break
+                    except:
+                        continue
+
+                # Capture grid images directly from canvas elements
+                grid_images_b64 = None
+                for fr in page.frames:
+                    try:
+                        grid_images_b64 = await fr.evaluate(capture_grid_js)
+                        if grid_images_b64 and any(grid_images_b64):
+                            print(f"    Captured {sum(1 for x in grid_images_b64 if x)} grid images from canvas")
+                            break
+                    except:
+                        continue
+
+                # Take full page screenshot
                 ss = await page.screenshot()
                 await page.screenshot(path=os.path.join(SCREENSHOTS_DIR, f"captcha_{ca}.png"))
 
-                if captcha_box:
-                    print(f"    CAPTCHA box: ({captcha_box['x']},{captcha_box['y']}) {captcha_box['w']}x{captcha_box['h']}")
+                # Get iframe position to convert coordinates
+                iframe_box = None
+                try:
+                    iframe_el = await page.query_selector('iframe[src*="passport.goofish.com"]')
+                    if iframe_el:
+                        iframe_box = await iframe_el.bounding_box()
+                        if iframe_box:
+                            print(f"    Iframe offset: ({iframe_box['x']:.0f},{iframe_box['y']:.0f})")
+                except:
+                    pass
 
-                    # Crop CAPTCHA area from screenshot for better AI accuracy
+                # Crop CAPTCHA from main page screenshot using iframe offset
+                if captcha_box and iframe_box:
                     try:
                         from PIL import Image
                         from io import BytesIO
                         img = Image.open(BytesIO(ss))
-                        cx, cy = captcha_box['x'], captcha_box['y']
-                        cw, ch = captcha_box['w'], captcha_box['h']
-                        # Add some padding
-                        pad = 10
+                        # Convert iframe-relative coords to main page coords
+                        cx = iframe_box['x'] + captcha_box['x']
+                        cy = iframe_box['y'] + captcha_box['y']
+                        cw = captcha_box['w']
+                        ch = captcha_box['h']
+                        pad = 5
                         cx = max(0, cx - pad)
                         cy = max(0, cy - pad)
                         cw = min(img.width - cx, cw + 2*pad)
                         ch = min(img.height - cy, ch + 2*pad)
                         cropped = img.crop((cx, cy, cx + cw, cy + ch))
                         buf = BytesIO()
-                        cropped.save(buf, format="JPEG", quality=85)
+                        cropped.save(buf, format="JPEG", quality=95)
                         ss_cropped = buf.getvalue()
-                        print(f"    Cropped CAPTCHA: {cropped.width}x{cropped.height}")
-                        # Save cropped for debug
+                        print(f"    Cropped CAPTCHA: {cropped.width}x{cropped.height} from ({cx:.0f},{cy:.0f})")
                         with open(os.path.join(SCREENSHOTS_DIR, f"captcha_cropped_{ca}.jpg"), "wb") as f:
                             f.write(ss_cropped)
-                    except:
+                    except Exception as e:
+                        print(f"    Crop error: {e}")
                         ss_cropped = ss
-                        cx, cy = 0, 0
                 else:
                     ss_cropped = ss
-                    cx, cy = 0, 0
 
                 print("    Sending to AI...")
-                sol = await solve_captcha_with_ai(page, ss_cropped)
+                sol = await solve_captcha_with_ai(page, ss_cropped, instruction_text, grid_images_b64)
 
                 # For grid_click type, pass grid data from detection
                 if sol and sol.get("type") == "grid_click" and captcha_box and captcha_box.get("grid"):
                     sol["grid"] = captcha_box["grid"]
                     print(f"    Grid data: {len(sol['grid'])} cells")
 
-                # Adjust coordinates to full page ONLY if we cropped (cx, cy > 0)
-                if sol and sol.get("positions") and (cx > 0 or cy > 0):
+                # Adjust coordinates to full page ONLY if we cropped and no grid indices
+                if sol and sol.get("positions") and (iframe_box):
                     for pos in sol["positions"]:
-                        pos["x"] = pos["x"] + cx
-                        pos["y"] = pos["y"] + cy
-                    print(f"    Adjusted coordinates: +({cx},{cy}) -> {sol['positions'][:2]}")
+                        if iframe_box:
+                            pos["x"] = pos["x"] + iframe_box['x']
+                            pos["y"] = pos["y"] + iframe_box['y']
+                    print(f"    Adjusted coordinates to main page")
                 if sol:
                     print(f"    AI solution: {sol}")
                     if await execute_captcha_action(page, sol):
