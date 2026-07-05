@@ -130,16 +130,21 @@ async def solve_captcha_with_ai(page, screenshot_bytes):
 
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    prompt = """This is a CAPTCHA image with a 3x3 grid of 9 photos.
+    prompt = """This is a CAPTCHA with a 3x3 grid of 9 photos (numbered 0-8, left-to-right, top-to-bottom).
 
-1. Read the Chinese instruction text at the top (after "——"). It lists 3 objects to find.
-2. List ALL 9 objects in the grid (left-to-right, top-to-bottom, 1-9).
-3. Return JSON with the CENTER coordinates of the 3 matching objects.
+Grid layout:
+0 1 2
+3 4 5
+6 7 8
 
-Example: If instruction says "请依次连出——手提包 大熊猫 马" (handbag, panda, horse):
-{"positions":[{"x":85,"y":95,"label":"handbag"},{"x":170,"y":95,"label":"panda"},{"x":255,"y":95,"label":"horse"}]}
+1. Read the Chinese instruction text at the top. It lists 3 objects to find.
+2. Identify each of the 9 images in the grid.
+3. Return the indices (0-8) of the 3 matching objects in order.
 
-IMPORTANT: Coordinates are relative to THIS image. Return ONLY the JSON, no other text."""
+Example: If instruction says "请依次连出——手提包 大熊猫 马" and handbag=4, panda=1, horse=7:
+{"type":"grid_click","indices":[4,1,7]}
+
+Be concise. Return ONLY the JSON."""
 
     payload = {
         "model": "",
@@ -196,6 +201,22 @@ IMPORTANT: Coordinates are relative to THIS image. Return ONLY the JSON, no othe
 
 def parse_ai_response(text):
     """Parse JSON from AI response text."""
+    # Try to find grid_click with indices
+    match = re.search(r'\{[^{}]*"indices"\s*:\s*\[', text, re.DOTALL)
+    if match:
+        start = text.rfind('{', 0, match.start() + 1)
+        if start >= 0:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == '{': depth += 1
+                elif text[i] == '}': depth -= 1
+                if depth == 0:
+                    try:
+                        sol = json.loads(text[start:i+1])
+                        sol.setdefault("type", "grid_click")
+                        return sol
+                    except:
+                        break
     # Try to find positions array
     match = re.search(r'\{[^{}]*"positions"\s*:\s*\[', text, re.DOTALL)
     if match:
@@ -212,12 +233,15 @@ def parse_ai_response(text):
                         return sol
                     except:
                         break
-    # Fallback: try any JSON with positions
-    match = re.search(r'\{.*"positions".*\}', text, re.DOTALL)
+    # Fallback: try any JSON with positions or indices
+    match = re.search(r'\{.*("positions"|"indices").*\}', text, re.DOTALL)
     if match:
         try:
             sol = json.loads(match.group())
-            sol.setdefault("type", "click_order")
+            if "indices" in sol:
+                sol.setdefault("type", "grid_click")
+            else:
+                sol.setdefault("type", "click_order")
             return sol
         except:
             pass
@@ -229,6 +253,12 @@ def parse_ai_response(text):
             positions.append({"x": int(x), "y": int(y), "label": "object"})
         if positions:
             return {"type": "click_order", "positions": positions}
+    # Try to extract grid indices from text
+    idx_match = re.search(r'indices["\']?\s*:\s*\[([\d,\s]+)\]', text)
+    if idx_match:
+        indices = [int(x.strip()) for x in idx_match.group(1).split(',') if x.strip().isdigit()]
+        if indices:
+            return {"type": "grid_click", "indices": indices}
     return None
 
 
@@ -274,6 +304,30 @@ async def execute_captcha_action(page, solution):
                     return True
         except Exception as e:
             print(f"    Slide error: {e}")
+
+    elif t == "grid_click":
+        # Grid indices (0-8) - click center of each grid cell
+        indices = solution.get("indices", [])
+        grid = solution.get("grid", [])
+        print(f"    Grid click: indices {indices}")
+        if not indices or not grid:
+            print("    No grid data!")
+            return False
+        try:
+            for idx in indices:
+                if idx < len(grid):
+                    cell = grid[idx]
+                    # Calculate center of the canvas cell
+                    cx = cell["x"] + cell["w"] / 2
+                    cy = cell["y"] + cell["h"] / 2
+                    print(f"    [{idx}] Clicking center at ({cx:.0f}, {cy:.0f})")
+                    await page.mouse.click(cx, cy)
+                    await page.wait_for_timeout(random.randint(500, 1000))
+            print("    All grid clicks done!")
+            await page.wait_for_timeout(2000)
+            return True
+        except Exception as e:
+            print(f"    Grid click error: {e}")
 
     elif t == "click_order":
         positions = solution.get("positions", [])
@@ -780,10 +834,8 @@ async def run_goofish_login():
             # ===== STEP 7: SOLVE CAPTCHA (appears after clicking 获取验证码) =====
             print("\n[8] Checking for CAPTCHA...")
 
-            # Detection JS: multi-signal approach
-            #   1) Alibaba baxia/nc security container elements
-            #   2) A grid of ~9 square images (the click puzzle)
-            #   3) The instruction text if present in DOM
+            # Detection JS: target canvas-based CAPTCHA grid
+            # The CAPTCHA uses <canvas id="connect-grid-0..8"> elements, not <img>
             detect_js = """
                 () => {
                     const h = (document.body.innerHTML || '').toLowerCase();
@@ -793,50 +845,64 @@ async def run_goofish_login():
                         '.baxia-dialog', '.baxia-dialog-content', '#baxia-dialog',
                         '.nc_wrapper', '.nc-container', '#nc_1_wrapper',
                         '[class*="captcha"]', '[id*="captcha"]',
+                        '[class*="connect-captcha"]', '#connect-captcha-question-container',
                         '[class*="puzzle"]', '[class*="_detect"]', '[class*="spatial"]'
                     ];
                     let hasContainer = false;
+                    let containerBox = null;
                     for (const s of containerSel) {
                         const el = document.querySelector(s);
-                        if (el && el.getBoundingClientRect().width > 0) { hasContainer = true; break; }
+                        if (el && el.getBoundingClientRect().width > 0) {
+                            hasContainer = true;
+                            const r = el.getBoundingClientRect();
+                            containerBox = {x: r.x, y: r.y, w: r.width, h: r.height};
+                            break;
+                        }
                     }
 
-                    // Signal 3: instruction text present as real DOM text
-                    const hasText = h.includes('请依次连出') || h.includes('连出') || h.includes('点击');
+                    // Signal 2: find canvas grid elements (connect-grid-0..8)
+                    const gridCanvases = document.querySelectorAll('canvas.grid, canvas[id^="connect-grid-"]');
+                    const allCanvases = document.querySelectorAll('canvas');
+                    const allImgs = document.querySelectorAll('img');
 
-                    // Signal 2: find square grid images
-                    const imgs = document.querySelectorAll('img, canvas');
-                    const allImgs = [];
+                    // Also check regular images
                     const gridImgs = [];
-                    for (const img of imgs) {
-                        const r = img.getBoundingClientRect();
+                    const allElements = [];
+                    for (const el of [...allCanvases, ...allImgs]) {
+                        const r = el.getBoundingClientRect();
                         if (r.width > 0 && r.height > 0) {
-                            allImgs.push({x: r.x, y: r.y, w: r.width, h: r.height});
-                            if (r.width >= 50 && r.width <= 200 && r.height >= 50 && r.height <= 200
-                                && Math.abs(r.width - r.height) < 40) {
-                                gridImgs.push({x: r.x, y: r.y, w: r.width, h: r.height});
+                            allElements.push({x: r.x, y: r.y, w: r.width, h: r.height, tag: el.tagName, id: el.id || '', cls: el.className || ''});
+                            // Grid: canvas elements with id connect-grid-* or class grid
+                            if (el.tagName === 'CANVAS' && (el.id.startsWith('connect-grid-') || el.className.includes('grid'))) {
+                                gridImgs.push({x: r.x, y: r.y, w: r.width, h: r.height, idx: parseInt(el.id.replace('connect-grid-', '') || '0')});
                             }
                         }
                     }
 
-                    const hasGrid = gridImgs.length >= 6;
-                    const found = hasContainer || hasText || hasGrid;
+                    // Signal 3: text
+                    const hasText = h.includes('请依次连出') || h.includes('连出') || h.includes('点击');
+
+                    const found = hasContainer || hasText || gridImgs.length >= 6;
                     if (!found) return {found: false};
 
-                    const debug = allImgs.map(i => `${Math.round(i.x)},${Math.round(i.y)} ${Math.round(i.w)}x${Math.round(i.h)}`).join(' | ');
+                    const debug = allElements.map(e => `${e.tag}#${e.id} ${Math.round(e.x)},${Math.round(e.y)} ${Math.round(e.w)}x${Math.round(e.h)}`).join(' | ');
 
                     if (gridImgs.length >= 6) {
                         let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
-                        for (const img of gridImgs) {
-                            minX = Math.min(minX, img.x);
-                            minY = Math.min(minY, img.y);
-                            maxX = Math.max(maxX, img.x + img.w);
-                            maxY = Math.max(maxY, img.y + img.h);
+                        for (const g of gridImgs) {
+                            minX = Math.min(minX, g.x);
+                            minY = Math.min(minY, g.y);
+                            maxX = Math.max(maxX, g.x + g.w);
+                            maxY = Math.max(maxY, g.y + g.h);
                         }
+                        // Sort by index to get correct order
+                        gridImgs.sort((a, b) => a.idx - b.idx);
                         return {found: true, x: minX, y: minY, w: maxX - minX, h: maxY - minY,
-                                imgCount: gridImgs.length, hasContainer, hasText, debug};
+                                imgCount: gridImgs.length, hasContainer, hasText,
+                                grid: gridImgs.map(g => ({x: g.x, y: g.y, w: g.w, h: g.h, idx: g.idx})),
+                                debug: debug};
                     }
-                    return {found: true, imgCount: gridImgs.length, totalImgs: allImgs.length,
+                    return {found: true, imgCount: gridImgs.length, totalImgs: allElements.length,
                             hasContainer, hasText, debug};
                 }
             """
@@ -845,22 +911,21 @@ async def run_goofish_login():
                 captcha_vis = False
                 captcha_box = None
 
-                # POLL for CAPTCHA to appear (up to 15s) - it loads async after the click
+                # POLL for CAPTCHA to appear (up to 15s)
                 for poll in range(15):
                     for fr in page.frames:
                         try:
                             result = await fr.evaluate(detect_js)
                             if result and result.get("found"):
                                 captcha_vis = True
-                                if result.get("w") and result.get("imgCount", 0) >= 6:
+                                if result.get("grid") and len(result.get("grid", [])) >= 6:
                                     captcha_box = result
-                                    print(f"    Grid: {result.get('imgCount')} images, box: ({int(result['x'])},{int(result['y'])}) {int(result['w'])}x{int(result['h'])}")
+                                    print(f"    Grid: {result.get('imgCount')} canvas cells, box: ({int(result['x'])},{int(result['y'])}) {int(result['w'])}x{int(result['h'])}")
                                     print(f"    Signals -> container:{result.get('hasContainer')} text:{result.get('hasText')} grid:{result.get('imgCount')}")
                                     if result.get("debug"):
-                                        print(f"    All imgs: {result['debug'][:300]}")
+                                        print(f"    All elements: {result['debug'][:400]}")
                                     break
                                 else:
-                                    # captcha present but grid not fully rendered yet - keep polling
                                     print(f"    CAPTCHA present (container:{result.get('hasContainer')} text:{result.get('hasText')} grid imgs:{result.get('imgCount', 0)}) - waiting for grid...")
                         except:
                             continue
@@ -914,6 +979,11 @@ async def run_goofish_login():
 
                 print("    Sending to AI...")
                 sol = await solve_captcha_with_ai(page, ss_cropped)
+
+                # For grid_click type, pass grid data from detection
+                if sol and sol.get("type") == "grid_click" and captcha_box and captcha_box.get("grid"):
+                    sol["grid"] = captcha_box["grid"]
+                    print(f"    Grid data: {len(sol['grid'])} cells")
 
                 # Adjust coordinates to full page ONLY if we cropped (cx, cy > 0)
                 if sol and sol.get("positions") and (cx > 0 or cy > 0):
