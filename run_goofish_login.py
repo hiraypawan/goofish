@@ -293,8 +293,8 @@ Return ONLY the JSON, no other text."""
                             sol = parse_ai_response(text)
                             if sol and sol.get("type") == "grid_click":
                                 indices = sol.get("indices", [])
-                                if not indices or len(indices) < 3:
-                                    print(f"    Incomplete indices: {indices}, trying next model...")
+                                if not indices or len(indices) < 3 or len(indices) > 4:
+                                    print(f"    Invalid indices count ({len(indices)}): {indices}, trying next model...")
                                     break
                             return sol
                     except Exception as e:
@@ -1365,11 +1365,17 @@ async def run_goofish_login():
                 mark_number_used(phone)
                 await page.screenshot(path=os.path.join(SCREENSHOTS_DIR, "07_success.png"))
                 print("\n  Browser open for 60s. Close when done.")
-                await page.wait_for_timeout(60000)
+                try:
+                    await page.wait_for_timeout(60000)
+                except:
+                    print("  Browser closed by user.")
             else:
                 print("\n  LOGIN MAY HAVE FAILED - check screenshots")
                 print("  Browser open for 30s.")
-                await page.wait_for_timeout(30000)
+                try:
+                    await page.wait_for_timeout(30000)
+                except:
+                    print("  Browser closed by user.")
 
             # ===== FULL CLEANUP before closing =====
             print("\n[12] Cleaning up all data...")
