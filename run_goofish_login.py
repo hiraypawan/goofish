@@ -1111,29 +1111,33 @@ async def run_goofish_login():
             # Intercept CAPTCHA API responses to extract instruction text
             captcha_api_data = {}
             
-            async def handle_captcha_response(route):
-                """Capture CAPTCHA API response data."""
-                response = route.request.response if hasattr(route, 'request') else None
-                if response:
-                    try:
-                        body = await response.text()
-                        if 'connect' in body.lower() or 'question' in body.lower() or 'captcha' in body.lower():
-                            captcha_api_data['response'] = body[:2000]
-                            print(f"    Captured CAPTCHA API response: {len(body)} bytes")
-                    except:
-                        pass
-                await route.continue_()
-            
-            # Also intercept via page.on('response')
             async def on_response(response):
                 url = response.url
-                if any(k in url for k in ['captcha', 'connect', 'baxia', 'punish']):
+                if any(k in url for k in ['captcha', 'connect', 'baxia', 'punish', 'gridConnect']):
                     try:
                         body = await response.text()
-                        if len(body) > 50:
-                            captcha_api_data['response'] = body[:3000]
-                            captcha_api_data['url'] = url
-                            print(f"    Captured response from: {url[:80]}")
+                        if len(body) > 10:
+                            captcha_api_data['last_response'] = body
+                            captcha_api_data['last_url'] = url
+                            print(f"    [API] {url[:60]}... ({len(body)} bytes)")
+                            # Try to extract instruction text
+                            import re as re2
+                            for pattern in [
+                                r'"question"\s*:\s*"([^"]+)"',
+                                r'"text"\s*:\s*"([^"]+)"',
+                                r'"instruction"\s*:\s*"([^"]+)"',
+                                r'"desc"\s*:\s*"([^"]+)"',
+                                r'"content"\s*:\s*"([^"]+)"',
+                                r'"title"\s*:\s*"([^"]+)"',
+                                r'请依次连出[——\-]+([^"<]+)',
+                                r'"word"\s*:\s*"([^"]+)"',
+                                r'"answer"\s*:\s*"([^"]+)"',
+                            ]:
+                                m = re2.search(pattern, body)
+                                if m:
+                                    captcha_api_data['instruction'] = m.group(1)
+                                    print(f"    [INSTRUCTION] {m.group(1)}")
+                                    break
                     except:
                         pass
             
@@ -1180,32 +1184,28 @@ async def run_goofish_login():
                 print("    Waiting for canvas images to load...")
                 await page.wait_for_timeout(3000)
 
-                # Get instruction text from the CAPTCHA frame or API response
+                # Get instruction text from API response or JavaScript
                 instruction_text = None
                 instruction_source = None
                 
                 # First check captured API response
-                if captcha_api_data.get('response'):
+                if captcha_api_data.get('instruction'):
+                    instruction_text = captcha_api_data['instruction']
+                    instruction_source = 'api_response'
+                    print(f"    Instruction from API: {instruction_text}")
+                elif captcha_api_data.get('last_response'):
                     try:
-                        api_text = captcha_api_data['response']
-                        # Look for instruction text in API response
+                        api_text = captcha_api_data['last_response']
                         import re as re2
-                        # Common patterns in CAPTCHA API responses
-                        for pattern in [
-                            r'"question"\s*:\s*"([^"]+)"',
-                            r'"text"\s*:\s*"([^"]+)"',
-                            r'"instruction"\s*:\s*"([^"]+)"',
-                            r'"desc"\s*:\s*"([^"]+)"',
-                            r'"content"\s*:\s*"([^"]+)"',
-                            r'"label"\s*:\s*"([^"]+)"',
-                            r'请依次连出[——\-]+([^"<]+)',
-                        ]:
-                            m = re2.search(pattern, api_text)
-                            if m:
-                                instruction_text = m.group(1)
-                                instruction_source = 'api_response'
-                                print(f"    Instruction from API: {instruction_text}")
-                                break
+                        # Try to find any Chinese text that looks like object names
+                        chinese_pattern = re2.findall(r'[\u4e00-\u9fff]{1,6}', api_text)
+                        # Filter out common UI text
+                        ui_text = {'请', '依次', '连出', '点击', '验证', '确定', '取消', '关闭', '刷新', '重试', '错误', '成功', '失败'}
+                        objects = [t for t in chinese_pattern if t not in ui_text and len(t) >= 1 and len(t) <= 4]
+                        if objects:
+                            instruction_text = ' '.join(objects[:6])
+                            instruction_source = 'api_chinese'
+                            print(f"    Chinese objects from API: {instruction_text}")
                     except:
                         pass
                 
