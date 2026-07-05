@@ -50,11 +50,14 @@ OTP_MAX_RETRIES = 3
 # OpenRouter - FREE vision models (get key at https://openrouter.ai/keys)
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Free vision models (try in order)
+# Vision models (free first, then cheap paid fallbacks)
 OPENROUTER_MODELS = [
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "meta-llama/llama-4-scout:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "google/gemini-2.0-flash-001",
+    "google/gemini-2.5-flash-preview",
 ]
 
 
@@ -103,7 +106,7 @@ def mark_number_used(phone):
 
 
 # ==================== AI CAPTCHA SOLVER (Pollinations.ai - FREE) ====================
-async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, grid_images_b64=None):
+async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, grid_images_b64=None, instruction_img_b64=None):
     """Send CAPTCHA screenshot to OpenRouter FREE vision API."""
     import aiohttp
 
@@ -116,20 +119,44 @@ async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, g
     try:
         from PIL import Image, ImageDraw, ImageFont
         from io import BytesIO
+        import base64 as b64mod
 
         if grid_images_b64 and any(grid_images_b64):
             # Compose a 3x3 grid from individual canvas captures
-            import base64 as b64mod
             cell_size = 120  # Original canvas size
             gap = 4
+            instr_h = 60  # Height for instruction area
+            
+            # If we have instruction canvas image, use its size for header
+            if instruction_img_b64:
+                try:
+                    instr_data = instruction_img_b64.split(',')[1] if ',' in instruction_img_b64 else instruction_img_b64
+                    instr_img = Image.open(BytesIO(b64mod.b64decode(instr_data)))
+                    instr_h = max(60, instr_img.height + 20)
+                except:
+                    pass
+            
             total_w = cell_size * 3 + gap * 2
-            total_h = cell_size * 3 + gap * 2 + 60  # Extra space for instruction
+            total_h = cell_size * 3 + gap * 2 + instr_h
             
             composed = Image.new('RGB', (total_w, total_h), (255, 255, 255))
             draw = ImageDraw.Draw(composed)
             
-            # Draw instruction area at top
-            if instruction_text:
+            # Draw instruction canvas image at top (contains the actual object names)
+            if instruction_img_b64:
+                try:
+                    instr_data = instruction_img_b64.split(',')[1] if ',' in instruction_img_b64 else instruction_img_b64
+                    instr_img = Image.open(BytesIO(b64mod.b64decode(instr_data)))
+                    # Scale up for better visibility
+                    scale = min(total_w / instr_img.width, instr_h / instr_img.height)
+                    new_w = int(instr_img.width * scale)
+                    new_h = int(instr_img.height * scale)
+                    instr_img = instr_img.resize((new_w, new_h), Image.LANCZOS)
+                    composed.paste(instr_img, (10, 5))
+                    print(f"    Instruction canvas: {instr_img.width}x{instr_img.height}")
+                except Exception as e:
+                    print(f"    Instruction canvas error: {e}")
+            elif instruction_text:
                 try:
                     font = ImageFont.truetype("arial.ttf", 20)
                 except:
@@ -149,7 +176,7 @@ async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, g
                     cell = cell.resize((cell_size, cell_size), Image.LANCZOS)
                     row, col = i // 3, i % 3
                     x = col * (cell_size + gap)
-                    y = 60 + row * (cell_size + gap)  # Offset for instruction area
+                    y = instr_h + row * (cell_size + gap)
                     composed.paste(cell, (x, y))
                 except Exception as e:
                     print(f"    Grid cell {i} error: {e}")
@@ -157,13 +184,28 @@ async def solve_captcha_with_ai(page, screenshot_bytes, instruction_text=None, g
             # Draw grid lines for clarity
             for i in range(4):
                 x = i * (cell_size + gap)
-                draw.line([(x, 60), (x, total_h)], fill=(200, 200, 200), width=1)
-                draw.line([(0, 60 + i * (cell_size + gap)), (total_w, 60 + i * (cell_size + gap))], fill=(200, 200, 200), width=1)
+                draw.line([(x, instr_h), (x, total_h)], fill=(200, 200, 200), width=1)
+                draw.line([(0, instr_h + i * (cell_size + gap)), (total_w, instr_h + i * (cell_size + gap))], fill=(200, 200, 200), width=1)
+            
+            # Add cell numbers for clarity
+            try:
+                font = ImageFont.truetype("arial.ttf", 14)
+            except:
+                font = ImageFont.load_default()
+            for i in range(9):
+                row, col = i // 3, i % 3
+                x = col * (cell_size + gap) + 2
+                y = instr_h + row * (cell_size + gap) + 2
+                draw.text((x, y), str(i), fill=(255, 0, 0), font=font)
             
             buf = BytesIO()
             composed.save(buf, format="JPEG", quality=95)
             img_bytes = buf.getvalue()
-            print(f"    Composed grid: {composed.width}x{composed.height}")
+            print(f"    Composed grid: {composed.width}x{composed.height}, {len(img_bytes)} bytes")
+            
+            # Save composed image for debug
+            with open(os.path.join(SCREENSHOTS_DIR, "captcha_composed.jpg"), "wb") as f:
+                f.write(img_bytes)
         else:
             # Use cropped screenshot
             img = Image.open(BytesIO(screenshot_bytes))
@@ -232,13 +274,13 @@ Return ONLY the JSON, no other text."""
             for model in OPENROUTER_MODELS:
                 payload["model"] = model
                 print(f"    Trying {model}...")
-                for retry in range(3):
+                for retry in range(2):
                     try:
                         async with session.post(OPENROUTER_URL, json=payload, headers=headers,
                                                 timeout=aiohttp.ClientTimeout(total=60)) as resp:
                             raw = await resp.text()
                             if resp.status == 429:
-                                wait_time = 15 * (retry + 1)
+                                wait_time = 8 * (retry + 1)
                                 print(f"    Rate limited, waiting {wait_time}s...")
                                 await asyncio.sleep(wait_time)
                                 continue
@@ -253,6 +295,11 @@ Return ONLY the JSON, no other text."""
                                 print(f"    Model refused, trying next...")
                                 break
                             sol = parse_ai_response(text)
+                            if sol and sol.get("type") == "grid_click":
+                                indices = sol.get("indices", [])
+                                if not indices or len(indices) < 3:
+                                    print(f"    Incomplete indices: {indices}, trying next model...")
+                                    break
                             return sol
                     except Exception as e:
                         print(f"    {model} error: {e}")
@@ -985,23 +1032,37 @@ async def run_goofish_login():
                 }
             """
 
-            # JS to capture each grid canvas as base64 image
+            # JS to capture instruction canvas + each grid canvas as base64 images
             capture_grid_js = """
                 () => {
-                    const results = [];
+                    const results = {instruction: null, grid: []};
+                    
+                    // Capture instruction canvas (the one with object names)
+                    const instrCanvas = document.querySelector('#connect-question-canvas');
+                    if (instrCanvas) {
+                        try {
+                            const tmp = document.createElement('canvas');
+                            tmp.width = instrCanvas.width;
+                            tmp.height = instrCanvas.height;
+                            const ctx = tmp.getContext('2d');
+                            ctx.drawImage(instrCanvas, 0, 0);
+                            results.instruction = tmp.toDataURL('image/png');
+                        } catch(e) {}
+                    }
+                    
+                    // Capture 9 grid canvases
                     for (let i = 0; i < 9; i++) {
                         const canvas = document.querySelector('#connect-grid-' + i);
-                        if (!canvas) { results.push(null); continue; }
+                        if (!canvas) { results.grid.push(null); continue; }
                         try {
-                            // Draw canvas to temp canvas to get clean data
                             const tmp = document.createElement('canvas');
                             tmp.width = canvas.width;
                             tmp.height = canvas.height;
                             const ctx = tmp.getContext('2d');
                             ctx.drawImage(canvas, 0, 0);
-                            results.push(tmp.toDataURL('image/png'));
+                            results.grid.push(tmp.toDataURL('image/png'));
                         } catch(e) {
-                            results.push(null);
+                            results.grid.push(null);
                         }
                     }
                     return results;
@@ -1056,13 +1117,15 @@ async def run_goofish_login():
                     except:
                         continue
 
-                # Capture grid images directly from canvas elements
-                grid_images_b64 = None
+                # Capture grid images directly from canvas elements (includes instruction canvas)
+                captured = None
                 for fr in page.frames:
                     try:
-                        grid_images_b64 = await fr.evaluate(capture_grid_js)
-                        if grid_images_b64 and any(grid_images_b64):
-                            print(f"    Captured {sum(1 for x in grid_images_b64 if x)} grid images from canvas")
+                        captured = await fr.evaluate(capture_grid_js)
+                        if captured and captured.get("grid"):
+                            grid_count = sum(1 for x in captured["grid"] if x)
+                            has_instr = "Yes" if captured.get("instruction") else "No"
+                            print(f"    Captured {grid_count} grid images + instruction: {has_instr}")
                             break
                     except:
                         continue
@@ -1112,7 +1175,9 @@ async def run_goofish_login():
                     ss_cropped = ss
 
                 print("    Sending to AI...")
-                sol = await solve_captcha_with_ai(page, ss_cropped, instruction_text, grid_images_b64)
+                grid_imgs = captured.get("grid") if captured else None
+                instr_img = captured.get("instruction") if captured else None
+                sol = await solve_captcha_with_ai(page, ss_cropped, instruction_text, grid_imgs, instr_img)
 
                 # For grid_click type, pass grid data from detection
                 if sol and sol.get("type") == "grid_click" and captcha_box and captcha_box.get("grid"):
