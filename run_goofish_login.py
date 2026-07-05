@@ -56,7 +56,7 @@ OPENROUTER_MODELS = [
     "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-nano-12b-v2-vl:free",
     "openrouter/free",
-    "google/gemini-2.0-flash-001",
+    "google/gemini-2.5-flash-preview-04-17",
 ]
 
 
@@ -1111,6 +1111,45 @@ async def run_goofish_login():
             # Intercept CAPTCHA API responses to extract instruction text
             captcha_api_data = {}
             
+            # Inject fetch interceptor into the iframe to capture CAPTCHA data
+            inject_interceptor_js = """
+                () => {
+                    // Override fetch to capture CAPTCHA API responses
+                    const origFetch = window.fetch;
+                    window.fetch = function(...args) {
+                        return origFetch.apply(this, args).then(response => {
+                            const url = typeof args[0] === 'string' ? args[0] : args[0].url;
+                            if (url && (url.includes('connect') || url.includes('captcha') || url.includes('gridConnect'))) {
+                                response.clone().text().then(body => {
+                                    window.__captcha_api_response = body;
+                                    window.__captcha_api_url = url;
+                                });
+                            }
+                            return response;
+                        });
+                    };
+                    
+                    // Override XMLHttpRequest to capture CAPTCHA API responses
+                    const origOpen = XMLHttpRequest.prototype.open;
+                    const origSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                        this.__url = url;
+                        return origOpen.call(this, method, url, ...rest);
+                    };
+                    XMLHttpRequest.prototype.send = function(...args) {
+                        this.addEventListener('load', function() {
+                            if (this.__url && (this.__url.includes('connect') || this.__url.includes('captcha') || this.__url.includes('gridConnect'))) {
+                                window.__captcha_api_response = this.responseText;
+                                window.__captcha_api_url = this.__url;
+                            }
+                        });
+                        return origSend.call(this, ...args);
+                    };
+                    
+                    return 'interceptor_installed';
+                }
+            """
+            
             async def on_response(response):
                 url = response.url
                 if any(k in url for k in ['captcha', 'connect', 'baxia', 'punish', 'gridConnect']):
@@ -1183,34 +1222,65 @@ async def run_goofish_login():
                 # Wait for canvas images to load
                 print("    Waiting for canvas images to load...")
                 await page.wait_for_timeout(3000)
-
-                # Get instruction text from API response or JavaScript
-                instruction_text = None
-                instruction_source = None
                 
-                # First check captured API response
-                if captcha_api_data.get('instruction'):
-                    instruction_text = captcha_api_data['instruction']
-                    instruction_source = 'api_response'
-                    print(f"    Instruction from API: {instruction_text}")
-                elif captcha_api_data.get('last_response'):
+                # Inject fetch interceptor into CAPTCHA frame
+                if captcha_frame:
                     try:
-                        api_text = captcha_api_data['last_response']
-                        import re as re2
-                        # Try to find any Chinese text that looks like object names
-                        chinese_pattern = re2.findall(r'[\u4e00-\u9fff]{1,6}', api_text)
-                        # Filter out common UI text
-                        ui_text = {'请', '依次', '连出', '点击', '验证', '确定', '取消', '关闭', '刷新', '重试', '错误', '成功', '失败'}
-                        objects = [t for t in chinese_pattern if t not in ui_text and len(t) >= 1 and len(t) <= 4]
-                        if objects:
-                            instruction_text = ' '.join(objects[:6])
-                            instruction_source = 'api_chinese'
-                            print(f"    Chinese objects from API: {instruction_text}")
+                        await captcha_frame.evaluate(inject_interceptor_js)
+                        print("    Injected fetch interceptor into CAPTCHA frame")
                     except:
                         pass
                 
-                # Then check JavaScript variables
-                if not instruction_text and captcha_frame:
+                # Wait a bit for interceptor to capture data
+                await page.wait_for_timeout(1000)
+                
+                # Read captured CAPTCHA API data from the frame
+                instruction_text = None
+                instruction_source = None
+                
+                if captcha_frame:
+                    try:
+                        api_data = await captcha_frame.evaluate("""
+                            () => {
+                                return {
+                                    response: window.__captcha_api_response || null,
+                                    url: window.__captcha_api_url || null
+                                };
+                            }
+                        """)
+                        if api_data and api_data.get('response'):
+                            print(f"    [INTERCEPTED] {api_data.get('url', 'unknown')[:60]}...")
+                            resp_text = api_data['response']
+                            print(f"    Response length: {len(resp_text)} bytes")
+                            # Save full response for debug
+                            captcha_api_data['intercepted'] = resp_text
+                            
+                            # Extract instruction text from intercepted response
+                            import re as re2
+                            for pattern in [
+                                r'"question"\s*:\s*"([^"]+)"',
+                                r'"text"\s*:\s*"([^"]+)"',
+                                r'"instruction"\s*:\s*"([^"]+)"',
+                                r'"desc"\s*:\s*"([^"]+)"',
+                                r'"content"\s*:\s*"([^"]+)"',
+                                r'"title"\s*:\s*"([^"]+)"',
+                                r'"word"\s*:\s*"([^"]+)"',
+                                r'"names"\s*:\s*\[([^\]]+)\]',
+                                r'"items"\s*:\s*\[([^\]]+)\]',
+                                r'请依次连出[——\-]+([^"<]+)',
+                            ]:
+                                m = re2.search(pattern, resp_text)
+                                if m:
+                                    instruction_text = m.group(1)
+                                    instruction_source = 'intercepted_api'
+                                    print(f"    [INSTRUCTION] {instruction_text}")
+                                    break
+                            
+                            if not instruction_text:
+                                # Print first 500 chars for debug
+                                print(f"    Response preview: {resp_text[:500]}")
+                    except Exception as e:
+                        print(f"    Interceptor read error: {e}")
                     try:
                         result = await captcha_frame.evaluate(get_instruction_js)
                         if result:
