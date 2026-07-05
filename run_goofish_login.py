@@ -1013,17 +1013,60 @@ async def run_goofish_login():
                 }
             """
 
-            # JS to extract instruction text from canvas
+            # JS to extract instruction text from CAPTCHA's JavaScript internals
             get_instruction_js = """
                 () => {
-                    const canvas = document.querySelector('#connect-question-canvas');
-                    if (!canvas) return null;
-                    // The instruction is rendered in canvas, try to get it from nearby text
-                    const h1 = document.querySelector('.h1');
-                    if (h1) return h1.textContent.trim();
-                    // Fallback: check for text in the header
-                    const header = document.querySelector('.connect-captcha-question-header');
-                    if (header) return header.textContent.trim();
+                    // Method 1: Look for CAPTCHA config/state variables
+                    const keys = ['captchaData', 'captchaInfo', 'connectData', '__data__', 
+                                  'questionData', 'challengeData', '_config', 'config'];
+                    for (const key of keys) {
+                        try {
+                            const val = window[key] || document[key];
+                            if (val && typeof val === 'object') {
+                                const str = JSON.stringify(val);
+                                if (str.includes('connect') || str.includes('question')) {
+                                    return {source: key, data: str.substring(0, 500)};
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    
+                    // Method 2: Search all script tags for CAPTCHA-related data
+                    const scripts = document.querySelectorAll('script');
+                    for (const s of scripts) {
+                        const t = s.textContent || '';
+                        // Look for instruction text patterns
+                        const m = t.match(/["']((?:请|连|点|手|狗|猫|鸟|鱼|花|树|车|球|包|伞|钟|灯|杯|帽|鞋|刀|锁|镜|琴|棋|书|笔|剪|扇|壶|瓶|盒|篮|鼓|锣|笛|琴|蛙|兔|马|牛|羊|鸡|鸭|蛇|鼠|猴|虎|龙|象|狮|熊|鹿|猪)[^"']{0,20})["']/);
+                        if (m) return {source: 'script_regex', text: m[1]};
+                    }
+                    
+                    // Method 3: Look for canvas context text rendering (text stored before drawing)
+                    const instrCanvas = document.querySelector('#connect-question-canvas');
+                    if (instrCanvas) {
+                        // Check for data attributes
+                        const attrs = {};
+                        for (const attr of instrCanvas.attributes) {
+                            attrs[attr.name] = attr.value;
+                        }
+                        // Check parent elements for data
+                        let el = instrCanvas.parentElement;
+                        for (let i = 0; i < 5 && el; i++) {
+                            for (const attr of el.attributes) {
+                                if (attr.value && attr.value.length > 2 && attr.value.length < 100) {
+                                    attrs['parent_' + attr.name] = attr.value;
+                                }
+                            }
+                            el = el.parentElement;
+                        }
+                        return {source: 'canvas_attrs', data: JSON.stringify(attrs)};
+                    }
+                    
+                    // Method 4: Get ALL visible text in the CAPTCHA container
+                    const container = document.querySelector('.connect-captcha-question, [class*="captcha"]');
+                    if (container) {
+                        return {source: 'container_text', text: container.innerText};
+                    }
+                    
                     return null;
                 }
             """
@@ -1065,6 +1108,37 @@ async def run_goofish_login():
                 }
             """
 
+            # Intercept CAPTCHA API responses to extract instruction text
+            captcha_api_data = {}
+            
+            async def handle_captcha_response(route):
+                """Capture CAPTCHA API response data."""
+                response = route.request.response if hasattr(route, 'request') else None
+                if response:
+                    try:
+                        body = await response.text()
+                        if 'connect' in body.lower() or 'question' in body.lower() or 'captcha' in body.lower():
+                            captcha_api_data['response'] = body[:2000]
+                            print(f"    Captured CAPTCHA API response: {len(body)} bytes")
+                    except:
+                        pass
+                await route.continue_()
+            
+            # Also intercept via page.on('response')
+            async def on_response(response):
+                url = response.url
+                if any(k in url for k in ['captcha', 'connect', 'baxia', 'punish']):
+                    try:
+                        body = await response.text()
+                        if len(body) > 50:
+                            captcha_api_data['response'] = body[:3000]
+                            captcha_api_data['url'] = url
+                            print(f"    Captured response from: {url[:80]}")
+                    except:
+                        pass
+            
+            page.on("response", on_response)
+            
             for ca in range(3):
                 captcha_vis = False
                 captcha_box = None
@@ -1106,13 +1180,48 @@ async def run_goofish_login():
                 print("    Waiting for canvas images to load...")
                 await page.wait_for_timeout(3000)
 
-                # Get instruction text from the CAPTCHA frame
+                # Get instruction text from the CAPTCHA frame or API response
                 instruction_text = None
-                if captcha_frame:
+                instruction_source = None
+                
+                # First check captured API response
+                if captcha_api_data.get('response'):
                     try:
-                        instruction_text = await captcha_frame.evaluate(get_instruction_js)
-                        if instruction_text:
-                            print(f"    Instruction: {instruction_text}")
+                        api_text = captcha_api_data['response']
+                        # Look for instruction text in API response
+                        import re as re2
+                        # Common patterns in CAPTCHA API responses
+                        for pattern in [
+                            r'"question"\s*:\s*"([^"]+)"',
+                            r'"text"\s*:\s*"([^"]+)"',
+                            r'"instruction"\s*:\s*"([^"]+)"',
+                            r'"desc"\s*:\s*"([^"]+)"',
+                            r'"content"\s*:\s*"([^"]+)"',
+                            r'"label"\s*:\s*"([^"]+)"',
+                            r'请依次连出[——\-]+([^"<]+)',
+                        ]:
+                            m = re2.search(pattern, api_text)
+                            if m:
+                                instruction_text = m.group(1)
+                                instruction_source = 'api_response'
+                                print(f"    Instruction from API: {instruction_text}")
+                                break
+                    except:
+                        pass
+                
+                # Then check JavaScript variables
+                if not instruction_text and captcha_frame:
+                    try:
+                        result = await captcha_frame.evaluate(get_instruction_js)
+                        if result:
+                            if isinstance(result, dict):
+                                instruction_source = result.get("source", "unknown")
+                                instruction_text = result.get("text") or result.get("data", "")
+                                print(f"    Instruction source: {instruction_source}")
+                                print(f"    Instruction data: {instruction_text[:200]}")
+                            elif isinstance(result, str):
+                                instruction_text = result
+                                print(f"    Instruction: {instruction_text}")
                     except:
                         pass
 
