@@ -776,63 +776,100 @@ async def run_goofish_login():
             # ===== STEP 7: SOLVE CAPTCHA (appears after clicking 获取验证码) =====
             print("\n[8] Checking for CAPTCHA...")
 
+            # Detection JS: the '请依次连出' text is a rendered IMAGE (not DOM text),
+            # so we detect the CAPTCHA by MULTIPLE signals:
+            #   1) Alibaba baxia / nc security container elements
+            #   2) A grid of ~9 square images (the click puzzle)
+            #   3) The instruction text if it happens to be in the DOM
+            detect_js = """
+                () => {
+                    const h = (document.body.innerHTML || '').toLowerCase();
+
+                    // Signal 1: known Alibaba captcha containers
+                    const containerSel = [
+                        '.baxia-dialog', '.baxia-dialog-content', '#baxia-dialog',
+                        '.nc_wrapper', '.nc-container', '#nc_1_wrapper',
+                        '[class*="captcha"]', '[id*="captcha"]',
+                        '[class*="puzzle"]', '[class*="_detect"]', '[class*="spatial"]'
+                    ];
+                    let hasContainer = false;
+                    for (const s of containerSel) {
+                        const el = document.querySelector(s);
+                        if (el && el.getBoundingClientRect().width > 0) { hasContainer = true; break; }
+                    }
+
+                    // Signal 3: instruction text present as real DOM text
+                    const hasText = h.includes('请依次连出') || h.includes('连出') || h.includes('点击');
+
+                    // Signal 2: find square grid images
+                    const imgs = document.querySelectorAll('img, canvas');
+                    const allImgs = [];
+                    const gridImgs = [];
+                    for (const img of imgs) {
+                        const r = img.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            allImgs.push({x: r.x, y: r.y, w: r.width, h: r.height});
+                            if (r.width >= 50 && r.width <= 200 && r.height >= 50 && r.height <= 200
+                                && Math.abs(r.width - r.height) < 40) {
+                                gridImgs.push({x: r.x, y: r.y, w: r.width, h: r.height});
+                            }
+                        }
+                    }
+
+                    const hasGrid = gridImgs.length >= 6;
+                    const found = hasContainer || hasText || hasGrid;
+                    if (!found) return {found: false};
+
+                    const debug = allImgs.map(i => `${Math.round(i.x)},${Math.round(i.y)} ${Math.round(i.w)}x${Math.round(i.h)}`).join(' | ');
+
+                    if (gridImgs.length >= 6) {
+                        let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
+                        for (const img of gridImgs) {
+                            minX = Math.min(minX, img.x);
+                            minY = Math.min(minY, img.y);
+                            maxX = Math.max(maxX, img.x + img.w);
+                            maxY = Math.max(maxY, img.y + img.h);
+                        }
+                        return {found: true, x: minX, y: minY, w: maxX - minX, h: maxY - minY,
+                                imgCount: gridImgs.length, hasContainer, hasText, debug};
+                    }
+                    return {found: true, imgCount: gridImgs.length, totalImgs: allImgs.length,
+                            hasContainer, hasText, debug};
+                }
+            """
+
             for ca in range(3):
                 captcha_vis = False
                 captcha_box = None
-                for fr in page.frames:
-                    try:
-                        result = await fr.evaluate("""
-                            () => {
-                                const h = document.body.innerHTML;
-                                const hasCaptcha = h.includes('请依次连出');
-                                if (!hasCaptcha) return {found: false};
-                                
-                                // Find ALL images and their sizes
-                                const imgs = document.querySelectorAll('img');
-                                const allImgs = [];
-                                const gridImgs = [];
-                                for (const img of imgs) {
-                                    const r = img.getBoundingClientRect();
-                                    if (r.width > 0 && r.height > 0) {
-                                        allImgs.push({x: r.x, y: r.y, w: r.width, h: r.height, src: (img.src||'').substring(0,50)});
-                                        // Grid images: roughly square, 60-150px, not the mascot
-                                        if (r.width >= 60 && r.width <= 160 && r.height >= 60 && r.height <= 160 
-                                            && Math.abs(r.width - r.height) < 30) {
-                                            gridImgs.push({x: r.x, y: r.y, w: r.width, h: r.height});
-                                        }
-                                    }
-                                }
-                                
-                                // Debug: log all images found
-                                const debug = allImgs.map(i => `${Math.round(i.x)},${Math.round(i.y)} ${Math.round(i.w)}x${Math.round(i.h)}`).join(' | ');
-                                
-                                if (gridImgs.length >= 9) {
-                                    let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
-                                    for (const img of gridImgs) {
-                                        minX = Math.min(minX, img.x);
-                                        minY = Math.min(minY, img.y);
-                                        maxX = Math.max(maxX, img.x + img.w);
-                                        maxY = Math.max(maxY, img.y + img.h);
-                                    }
-                                    return {found: true, x: minX, y: minY, w: maxX - minX, h: maxY - minY, imgCount: gridImgs.length, debug: debug};
-                                }
-                                
-                                return {found: true, imgCount: gridImgs.length, totalImgs: allImgs.length, debug: debug};
-                            }
-                        """)
-                        if result and result.get("found"):
-                            captcha_vis = True
-                            if result.get("w"):
-                                captcha_box = result
-                                print(f"    Grid: {result.get('imgCount', '?')} images, box: ({result['x']},{result['y']}) {result['w']}x{result['h']}")
-                            if result.get("debug"):
-                                print(f"    All imgs: {result['debug'][:300]}")
-                            break
-                    except:
-                        continue
+
+                # POLL for the CAPTCHA to appear (up to 15s) - it loads async after the click
+                for poll in range(15):
+                    for fr in page.frames:
+                        try:
+                            result = await fr.evaluate(detect_js)
+                            if result and result.get("found"):
+                                captcha_vis = True
+                                if result.get("w") and result.get("imgCount", 0) >= 6:
+                                    captcha_box = result
+                                    print(f"    Grid: {result.get('imgCount')} images, box: ({int(result['x'])},{int(result['y'])}) {int(result['w'])}x{int(result['h'])}")
+                                    print(f"    Signals -> container:{result.get('hasContainer')} text:{result.get('hasText')} grid:{result.get('imgCount')}")
+                                    if result.get("debug"):
+                                        print(f"    All imgs: {result['debug'][:300]}")
+                                    break
+                                else:
+                                    # captcha present but grid not fully rendered yet - keep polling
+                                    print(f"    CAPTCHA present (container:{result.get('hasContainer')} text:{result.get('hasText')} grid imgs:{result.get('imgCount', 0)}) - waiting for grid...")
+                        except:
+                            continue
+                    if captcha_box:
+                        break
+                    await page.wait_for_timeout(1000)
+
                 if not captcha_vis:
                     print("    No CAPTCHA - proceeding")
                     break
+                if not captcha_box:
+                    print("    CAPTCHA detected but grid not found - capturing full popup for AI")
 
                 print(f"    CAPTCHA detected! Attempt {ca+1}/3")
 
